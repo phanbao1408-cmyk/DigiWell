@@ -10,6 +10,7 @@ interface InsightTabProps {
   waterGoal: number;
   weeklyChartData: { d: string; ml: number; isToday: boolean; }[];
   progress: number;
+  streak: number;
   isAiLoading: boolean;
   aiAdvice: string;
   fetchAIAdvice: () => void;
@@ -20,7 +21,7 @@ const card = "bg-slate-800/60 backdrop-blur-sm border border-slate-700/50 rounde
 
 export default function InsightTab({
   isPremium, setShowPremiumModal, isExportingPDF, handleExportPDF,
-  waterIntake, waterGoal, weeklyChartData, progress, isAiLoading, aiAdvice, fetchAIAdvice, setShowAiChat
+  waterGoal, weeklyChartData, progress, streak, isAiLoading, aiAdvice, fetchAIAdvice, setShowAiChat
 }: InsightTabProps) {
   const weeklyStats = useMemo(() => {
     if (!weeklyChartData || weeklyChartData.length === 0) {
@@ -80,7 +81,7 @@ export default function InsightTab({
         {[
           { label: 'Trung bình/ngày', val: weeklyStats.avg.toLocaleString(), unit: 'ml', color: '#22d3ee' },
           { label: 'Hoàn thành mục tiêu', val: weeklyStats.completed.toString(), unit: '/ 7 ngày', color: '#34d399' },
-          { label: 'Chuỗi liên tiếp', val: '3', unit: 'ngày', color: '#fbbf24' },
+          { label: 'Chuỗi liên tiếp', val: streak.toString(), unit: 'ngày', color: '#fbbf24' },
           { label: 'Tiến độ hôm nay', val: `${Math.round(progress)}`, unit: '%', color: '#a78bfa' },
         ].map(s => (
           <div key={s.label} className={`${card} p-5`}>

@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
 
 export type AiChatMessage = {
   role: 'user' | 'assistant';
@@ -257,18 +257,18 @@ Tin nhắn người dùng: "${input}"`;
         name: 'recordWaterIntake',
         description: 'Gọi hàm này bất cứ khi nào người dùng nói họ vừa uống nước, trà, cà phê, sữa, bia, rượu hoặc muốn ghi nhận lượng uống.',
         parameters: {
-          type: 'OBJECT' as const,
+          type: Type.OBJECT,
           properties: {
             amount: {
-              type: 'INTEGER' as const,
+              type: Type.INTEGER,
               description: 'Dung tích đồ uống tính bằng ml, ví dụ 200, 300, 500.',
             },
             factor: {
-              type: 'NUMBER' as const,
+              type: Type.NUMBER,
               description: 'Hệ số hydration: nước/nước trái cây=1.0, cà phê/trà đậm=0.8, sữa/bù khoáng=1.1, bia/rượu/cồn=-0.5.',
             },
             name: {
-              type: 'STRING' as const,
+              type: Type.STRING,
               description: 'Tên loại đồ uống, ví dụ Nước lọc, Cà phê sữa, Trà đào, Bia.',
             },
           },

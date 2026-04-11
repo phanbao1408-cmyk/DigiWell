@@ -1,17 +1,16 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { 
-  Droplet, Eye, ShieldCheck, Activity, Coffee, Dumbbell, 
-  MonitorPlay, User, 
-  Lock, Home, BarChart2, Trophy, Rss,
-  Target, Zap, Watch, Bluetooth, RefreshCw,
-  CloudSun, Calendar, Bell, Scan, Cpu, Sparkles, Plus, Settings,
-  Users, UserPlus, Search, Share2, Edit2, Heart, ImagePlus, UserMinus, Bot, X, Send,
-  Medal, Flame, Bike
+  Droplet, Eye, ShieldCheck, Coffee,
+  Lock, Trophy, Target, Watch, Bluetooth, RefreshCw,
+  CloudSun, Calendar, Bell, Sparkles,
+  Users, UserPlus, Search, Share2, Edit2, ImagePlus, UserMinus, Plus, X
 } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
 import { supabase, isSupabaseConfigured } from './lib/supabase';
 import { GoogleGenAI } from '@google/genai';
 import { Capacitor } from '@capacitor/core';
+import { App as CapacitorApp } from '@capacitor/app';
+import { Browser } from '@capacitor/browser';
 import { Health } from '@capgo/capacitor-health';
 import { LocalNotifications, type ActionPerformed } from '@capacitor/local-notifications';
 import {
@@ -28,21 +27,9 @@ import {
   type HydrationReminderSettings,
 } from './lib/hydrationReminders';
 import {
-  calculateWaterTotal,
-  clearPendingWaterSync,
-  getPendingWaterSync,
-  getTodayWaterDay,
-  listPendingWaterSyncs,
-  loadStoredWaterEntries,
-  saveStoredWaterEntries,
-  upsertPendingWaterSync,
-  type WaterEntry,
-} from './lib/waterStorage';
-import {
   buildProgressShareText,
   DEFAULT_SOCIAL_COMPOSER,
   DEFAULT_SOCIAL_PROFILE_STATS,
-  getRelativeTimeLabel,
   isMissingSocialSchemaError,
   type SocialComposerState,
   type SocialDiscoverProfile,
@@ -50,14 +37,18 @@ import {
   type SocialProfileStats,
 } from './lib/social';
 
-// FIX BUG: Định nghĩa thêm trường actual_ml để tránh lỗi TypeScript khi dùng WaterEntry
-type LocalWaterEntry = WaterEntry & { actual_ml?: number };
-
+import { useWaterData } from './useWaterData';
 import WelcomeScreen from './WelcomeScreen';
 import LoginScreen from './LoginScreen';
 import RegisterScreen from './RegisterScreen';
-import InsightTab from './InsightTab';
-import LeagueTab from './LeagueTab';
+import AiChatModal from './components/modals/AiChatModal';
+import BottomNav, { type TabType } from './components/layout/BottomNav';
+import HomeTab, { type DrinkPreset, renderIcon, presetStyles } from './tabs/HomeTab';
+import AutoActivityCard from './components/AutoActivityCard';
+import FeedTab from './tabs/FeedTab';
+import ProfileTab from './tabs/ProfileTab';
+import InsightTab from './tabs/InsightTab';
+import LeagueTab from './tabs/LeagueTab';
 
 // ============================================================================
 // DIGIWELL SMART WELLNESS - PREMIUM DARK UI (V7 FIXED)
@@ -70,11 +61,29 @@ function AppContent() {
   // FIX BUG: Ref để thay thế useEffectEvent bị lỗi không tồn tại trong React 18
   const handleHydrationNotificationActionRef = useRef<((action: ActionPerformed) => Promise<void>) | null>(null);
 
+  // Lắng nghe Deep Link để đóng In-App Browser và truyền Token cho Supabase
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) {
+      const sub = CapacitorApp.addListener('appUrlOpen', (event) => {
+        if (event.url.includes('login-callback')) {
+          Browser.close().catch(() => {});
+          // Trích xuất chuỗi token từ URL Scheme và đẩy vào window.location để Supabase tự bắt
+          const urlStr = event.url;
+          if (urlStr.includes('#') || urlStr.includes('?')) {
+            const fragment = urlStr.substring(urlStr.indexOf(urlStr.includes('?') ? '?' : '#'));
+            window.location.href = `${window.location.origin}${window.location.pathname}${fragment}`;
+          }
+        }
+      });
+      return () => { sub.then(s => s.remove()); };
+    }
+  }, []);
+
   // ==========================================================================
   // [1] QUẢN LÝ TRẠNG THÁI (STATES)
   // ==========================================================================
   const [view, setView] = useState<'welcome' | 'login' | 'register' | 'app'>('welcome');
-  const [activeTab, setActiveTab] = useState<'home' | 'insight' | 'league' | 'feed' | 'profile'>('home');
+  const [activeTab, setActiveTab] = useState<TabType>('home');
   const [isWatchConnected, setIsWatchConnected] = useState(false);
   const [watchData, setWatchData] = useState({ heartRate: 0, steps: 0 });
   const [isWeatherSynced, setIsWeatherSynced] = useState(false);
@@ -88,27 +97,19 @@ function AppContent() {
   
   const [now, setNow] = useState(() => new Date());
   const [profile, setProfile] = useState<any>(null);
-  const [, setIsLoadingProfile] = useState(true);
   
   const [loginPrefill, setLoginPrefill] = useState('');
   
   // Giữ lại để demo thuật toán thủ công khi chưa kết nối thiết bị
   const [currentActivity, setCurrentActivity] = useState<'chill' | 'light' | 'hard'>('chill');
   
-  const [waterIntake, setWaterIntake] = useState(0);
   const [streak] = useState(3); // Giữ lại state để sẵn sàng cho logic tự động tăng chuỗi sau này
 
+  const [weeklyHistory, setWeeklyHistory] = useState<{d: string, ml: number, isToday: boolean}[]>([]);
   // Lịch sử từng lần uống (lưu localStorage theo ngày)
   type PendingHydrationAction = { amount: number; name: string; timestamp: number };
   const PENDING_HYDRATION_ACTIONS_KEY = 'digiwell_pending_hydration_actions';
-  const [waterEntries, setWaterEntries] = useState<LocalWaterEntry[]>([]);
   const [showHistory, setShowHistory] = useState(false);
-  const [editingEntry, setEditingEntry] = useState<LocalWaterEntry | null>(null);
-  const [editAmount, setEditAmount] = useState('');
-  const waterEntriesRef = useRef<LocalWaterEntry[]>([]);
-  const waterIntakeRef = useRef(0);
-  const [hasPendingCloudSync, setHasPendingCloudSync] = useState(false);
-  const hasPendingCloudSyncRef = useRef(false);
 
   // State cho tính năng Scan AI
   const [isScanning, setIsScanning] = useState(false);
@@ -125,7 +126,6 @@ function AppContent() {
   const [customDrinkForm, setCustomDrinkForm] = useState({ name: 'Trà đào', amount: 300 as number | string, factor: 1.0 });
 
   // State cho Menu đồ uống mặc định
-  type DrinkPreset = { id: string; name: string; amount: number; factor: number; icon: string; color: string; };
   const [drinkPresets, setDrinkPresets] = useState<DrinkPreset[]>(() => {
     const saved = localStorage.getItem('digiwell_presets');
     return saved ? JSON.parse(saved) : [
@@ -185,7 +185,6 @@ function AppContent() {
   const [socialImageFile, setSocialImageFile] = useState<File | null>(null);
   const [socialImagePreview, setSocialImagePreview] = useState('');
   const socialImageInputRef = useRef<HTMLInputElement>(null);
-  const chatEndRef = useRef<HTMLDivElement>(null);
 
   // ==========================================================================
   // [NEW] CẬP NHẬT HỒ SƠ STATES
@@ -223,22 +222,6 @@ function AppContent() {
         climate: p.climate, goal: p.goal, wakeUp: p.wake_up, bedTime: p.bed_time
       };
     } catch { return null; }
-  };
-
-  const fetchTodayWaterCloud = async (userId: string) => {
-    try {
-      const todayStr = getTodayWaterDay();
-      const { data, error } = await supabase!
-        .from('water_logs')
-        .select('intake_ml')
-        .eq('user_id', userId)
-        .eq('day', todayStr)
-        .maybeSingle();
-      if (error) throw error;
-      return data ? data.intake_ml : 0;
-    } catch {
-      return null;
-    }
   };
 
   // Tải danh sách bạn bè thật từ Supabase
@@ -298,7 +281,7 @@ function AppContent() {
       .ilike('nickname', `%${query}%`)
       .neq('id', profile?.id)
       .limit(5);
-    if (!error && data) setSearchResults(data);
+    if (!error && data) setSearchResults(data.map((u: any) => ({ ...u, nickname: u.nickname || 'Người dùng' })));
     setIsSearching(false);
   };
 
@@ -366,14 +349,12 @@ function AppContent() {
           }
         } else if (event === 'SIGNED_OUT' || !session) { 
           setProfile(null); 
-          setWaterIntake(0);
-          setHasPendingCloudSync(false);
           setChatMessages([]); // Dọn dẹp tin nhắn AI khi đăng xuất
           localStorage.removeItem('google_provider_token'); // Xóa token Google khi đăng xuất
           setView('welcome'); 
         }
-      } finally { 
-        if (isMounted) setIsLoadingProfile(false); 
+          } catch (error) {
+            console.error(error);
       }
     });
     
@@ -389,7 +370,61 @@ function AppContent() {
     if (leagueMode === 'friends' && activeTab === 'league') {
       fetchFriendsData();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leagueMode, activeTab, profile?.id]);
+
+  // ==========================================================================
+  // [NEW] WATER DATA HOOK
+  // ==========================================================================
+  const { waterIntake, waterEntries, handleAddWater, handleDeleteEntry, handleEditEntry, editingEntry, setEditingEntry, editAmount, setEditAmount, hasPendingCloudSync, waterIntakeRef, waterEntriesRef } = useWaterData(profile);
+
+  // Tải dữ liệu nước trong tuần (REAL DATA)
+  useEffect(() => {
+    const fetchWeeklyHistory = async () => {
+        const dayLabels = ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'];
+        const today = new Date();
+        const dateList: { date: Date, dayStr: string }[] = [];
+        for (let i = 6; i >= 0; i--) {
+            const d = new Date(today);
+            d.setDate(today.getDate() - i);
+              // FIX TIMEZONE BUG: Dùng Local format thay vì toISOString (UTC) để không bị lùi ngày
+              const localDateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+              dateList.push({ date: d, dayStr: localDateStr });
+        }
+
+        if (!profile?.id) {
+            const emptyHistory = dateList.map((d, index) => ({
+                d: index === 6 ? 'HN' : dayLabels[d.date.getDay()],
+                ml: 0,
+                isToday: index === 6,
+            }));
+            setWeeklyHistory(emptyHistory);
+            return;
+        }
+
+        const dateStrings = dateList.map(d => d.dayStr);
+
+        try {
+            const { data: cloudData, error } = await supabase!
+                .from('water_logs')
+                .select('day, intake_ml')
+                .eq('user_id', profile.id)
+                .in('day', dateStrings);
+
+            if (error) throw error;
+
+            const dataMap = new Map(cloudData?.map(d => [d.day, d.intake_ml]));
+
+            const history = dateList.map((d, index) => ({
+                d: index === 6 ? 'HN' : dayLabels[d.date.getDay()],
+                ml: index === 6 ? waterIntake : (dataMap.get(d.dayStr) || 0),
+                isToday: index === 6,
+            }));
+            setWeeklyHistory(history);
+        } catch (err) { console.error("Lỗi tải lịch sử tuần:", err); }
+    };
+    fetchWeeklyHistory();
+  }, [profile?.id, waterIntake]);
 
   // ==========================================================================
   // [3.1] PERSIST CÀI ĐẶT ĐỒNG BỘ THEO USER
@@ -430,15 +465,6 @@ function AppContent() {
       setShowOnboarding(true);
     }
   }, [profile?.id]);
-
-  // Tự động cuộn xuống tin nhắn mới nhất trong Chat AI
-  useEffect(() => {
-    if (showAiChat && chatEndRef.current) {
-      setTimeout(() => {
-        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-      }, 100);
-    }
-  }, [chatMessages, isChatLoading, showAiChat]);
 
   useEffect(() => {
     if (profile?.id && isPrefsLoaded) {
@@ -529,30 +555,17 @@ function AppContent() {
   }, [profile?.id, view]);
 
   useEffect(() => {
-    if (!profile?.id) return;
-
-    void flushPendingWaterSyncs(true);
-
-    const handleOnline = () => {
-      void flushPendingWaterSyncs();
-    };
-
-    window.addEventListener('online', handleOnline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-    };
-  }, [profile?.id]);
-
-  useEffect(() => {
     if (activeTab === 'feed' && profile?.id) {
       void refreshSocialFeed();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, profile?.id]);
 
   useEffect(() => {
     if (showDiscoverPeople && profile?.id) {
       void loadSocialDirectory(socialSearchQuery);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showDiscoverPeople, profile?.id]);
 
   useEffect(() => () => {
@@ -561,11 +574,40 @@ function AppContent() {
     }
   }, [socialImagePreview]);
 
+  const lastDayRef = useRef(new Date().getDate());
+
   useEffect(() => {
     let timer: number | undefined;
-    const start = () => { if (timer) return; timer = window.setInterval(() => setNow(new Date()), 1000); };
+
+    // Hàm kiểm tra ép Reset nếu phát hiện lệch ngày
+    const checkMidnight = (currDate: Date) => {
+      if (currDate.getDate() !== lastDayRef.current) {
+        lastDayRef.current = currDate.getDate();
+        window.location.reload(); // Quét sạch state cũ và nạp lại ngày mới
+      }
+    };
+
+    const start = () => { 
+      if (timer) return; 
+      timer = window.setInterval(() => {
+        setNow(prev => {
+          const curr = new Date();
+          checkMidnight(curr); // Quét mỗi giây khi app đang bật
+          return curr;
+        });
+      }, 1000); 
+    };
     const stop = () => { if (!timer) return; window.clearInterval(timer); timer = undefined; };
-    const onVis = () => { if (document.visibilityState === 'visible') { setNow(new Date()); start(); } else stop(); };
+    const onVis = () => { 
+      if (document.visibilityState === 'visible') { 
+        const curr = new Date();
+        checkMidnight(curr); // KIỂM TRA NGAY LẬP TỨC khi app vừa được đánh thức từ Background!
+        setNow(curr); 
+        start(); 
+      } else {
+        stop(); 
+      }
+    };
     start();
     document.addEventListener('visibilitychange', onVis);
     return () => { stop(); document.removeEventListener('visibilitychange', onVis); };
@@ -597,16 +639,15 @@ function AppContent() {
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         
-        // 3. Query tổng số bước chân
-        const stepsRes = await Health.readSamples({
+        // 3. Yêu cầu Apple Health tự tính TỔNG bước chân trong ngày
+        const stepsRes = await Health.queryAggregated({
           dataType: 'steps',
           startDate: today.toISOString(),
           endDate: new Date().toISOString(),
-          limit: 2000
+          bucket: 'day',
+          aggregation: 'sum'
         });
-        const totalSteps = Array.isArray(stepsRes?.samples) 
-          ? stepsRes.samples.reduce((sum: number, item: any) => sum + (item.value || 0), 0) 
-          : 0;
+        const totalSteps = stepsRes?.samples && stepsRes.samples.length > 0 ? stepsRes.samples[0].value : 0;
 
         // 4. Query nhịp tim gần nhất (lấy limit: 1)
         const hrRes = await Health.readSamples({
@@ -644,22 +685,6 @@ function AppContent() {
     if (wp >= 1500) return { name: 'Vàng', color: 'text-yellow-400', bg: 'bg-yellow-500/20', border: 'border-yellow-500/30' };
     if (wp >= 800) return { name: 'Bạc', color: 'text-slate-300', bg: 'bg-slate-500/20', border: 'border-slate-500/30' };
     return { name: 'Đồng', color: 'text-orange-400', bg: 'bg-orange-500/20', border: 'border-orange-500/30' };
-  };
-
-  // Helper render Icon động cho Menu
-  const renderIcon = (name: string, props: any) => {
-    if (name === 'Droplet') return <Droplet {...props} />;
-    if (name === 'Coffee') return <Coffee {...props} />;
-    if (name === 'Activity') return <Activity {...props} />;
-    if (name === 'Zap') return <Zap {...props} />;
-    return <Droplet {...props} />;
-  };
-
-  const presetStyles: any = {
-    cyan: { bg: 'bg-cyan-500/20', border: 'border-cyan-500/30', text: 'text-cyan-400', hover: 'hover:bg-cyan-500/30' },
-    orange: { bg: 'bg-orange-500/20', border: 'border-orange-500/30', text: 'text-orange-400', hover: 'hover:bg-orange-500/30' },
-    emerald: { bg: 'bg-emerald-500/20', border: 'border-emerald-500/30', text: 'text-emerald-400', hover: 'hover:bg-emerald-500/30' },
-    red: { bg: 'bg-red-500/20', border: 'border-red-500/30', text: 'text-red-400', hover: 'hover:bg-red-500/30' }
   };
 
   const handleUpdatePreset = (index: number, field: string, value: any) => {
@@ -1111,6 +1136,7 @@ ${historyText}`;
       const ai = createGeminiClient();
       const modelsToTry = await getGenerateContentModels(ai);
       let advice = "";
+      let lastErr: unknown = null;
 
       // Cấu hình Native Function Calling cho Gemini
       const tools = [{
@@ -1188,20 +1214,20 @@ ${historyText}`;
 
               if (call.name === 'recordWaterIntake') {
                 const { amount, factor, name } = call.args as any;
-                await handleAddWater(amount, factor, name);
-                functionResult = { success: true, message: `Đã cộng ${amount}ml (${name}). Nước hiện tại: ${waterIntakeRef.current}/${waterGoal}ml` };
+                const newTotal = await handleAddWater(amount, factor, name);
+                functionResult = { success: true, message: `Đã cộng ${amount}ml (${name}). Nước hiện tại: ${newTotal}/${waterGoal}ml` };
               } else if (call.name === 'deleteLastWaterIntake') {
                 if (waterEntriesRef.current.length > 0) {
                   const lastEntry = waterEntriesRef.current[waterEntriesRef.current.length - 1];
-                  await handleDeleteEntry(lastEntry.id);
-                  functionResult = { success: true, message: `Đã xóa ${lastEntry.actual_ml || lastEntry.amount}ml gần nhất.` };
+                  const newTotal = await handleDeleteEntry(lastEntry.id);
+                  functionResult = { success: true, message: `Đã xóa ${lastEntry.actual_ml || lastEntry.amount}ml gần nhất. Nước còn lại: ${newTotal}ml.` };
                 } else {
                   functionResult = { success: false, message: `Không có dữ liệu nước nào hôm nay để xóa.` };
                 }
               } else if (call.name === 'navigateTab') {
                 const { tabName } = call.args as any;
                 if (['home', 'insight', 'league', 'feed', 'profile'].includes(tabName)) {
-                  setActiveTab(tabName as any);
+                  setActiveTab(tabName as TabType);
                   setTimeout(() => setShowAiChat(false), 1500);
                   functionResult = { success: true, message: `Đã chuyển đến trang ${tabName}` };
                 } else {
@@ -1233,10 +1259,12 @@ ${historyText}`;
               isDone = true;
             }
           }
-          if (advice) break;
-        } catch (err) {}
+          if (advice) {
+            break;
+          }
+        } catch (err) { lastErr = err; }
       }
-      if (!advice) throw new Error("Không nhận được phản hồi");
+      if (!advice) throw lastErr || new Error("Không nhận được phản hồi");
 
       setChatMessages(prev => [...prev, { role: 'assistant', content: advice }]);
     } catch (err: any) {
@@ -1296,75 +1324,6 @@ ${historyText}`;
     }
   };
 
-  // Helper: sync tổng lên Supabase
-  const flushPendingWaterSyncs = async (silent: boolean = false) => {
-    if (!profile?.id) return false;
-
-    const pendingSyncs = listPendingWaterSyncs(profile.id).sort((a, b) => a.updatedAt - b.updatedAt);
-    if (pendingSyncs.length === 0) {
-      setHasPendingCloudSync(false);
-      return true;
-    }
-
-    try {
-      for (const sync of pendingSyncs) {
-        const { error } = await supabase!.from('water_logs').upsert({
-          user_id: sync.userId,
-          day: sync.day,
-          intake_ml: sync.total,
-        }, { onConflict: 'user_id,day' });
-        if (error) throw error;
-
-        clearPendingWaterSync(sync.userId, sync.day);
-      }
-
-      setHasPendingCloudSync(false);
-      if (!silent) {
-        toast.success(`Đã đồng bộ ${pendingSyncs.length} bản ghi offline lên Cloud!`);
-      }
-      return true;
-    } catch {
-      setHasPendingCloudSync(true);
-      return false;
-    }
-  };
-
-  const syncTotalToCloud = async (total: number, options?: { silent?: boolean }) => {
-    if (!profile?.id) return;
-    const todayStr = getTodayWaterDay();
-
-    try {
-      const { error } = await supabase!.from('water_logs').upsert({
-        user_id: profile.id,
-        day: todayStr,
-        intake_ml: total,
-      }, { onConflict: 'user_id,day' });
-      if (error) throw error;
-
-      clearPendingWaterSync(profile.id, todayStr);
-      setHasPendingCloudSync(false);
-      await flushPendingWaterSyncs(true);
-    } catch {
-      upsertPendingWaterSync({
-        userId: profile.id,
-        day: todayStr,
-        total,
-        updatedAt: Date.now(),
-      });
-      setHasPendingCloudSync(true);
-
-      if (!options?.silent && !hasPendingCloudSyncRef.current) {
-        toast.warning("Đã lưu offline. DigiWell sẽ tự đồng bộ khi có mạng lại.");
-      }
-    }
-  };
-
-  // Helper: lưu entries vào localStorage
-  const saveEntries = (entries: LocalWaterEntry[]) => {
-    if (!profile?.id) return;
-    saveStoredWaterEntries(profile.id, entries, getTodayWaterDay());
-  };
-
   const readPendingHydrationActions = (): PendingHydrationAction[] => {
     try {
       return JSON.parse(localStorage.getItem(PENDING_HYDRATION_ACTIONS_KEY) || '[]');
@@ -1381,93 +1340,6 @@ ${historyText}`;
 
   const clearPendingHydrationActions = () => {
     localStorage.removeItem(PENDING_HYDRATION_ACTIONS_KEY);
-  };
-
-  // Load dữ liệu nước trong ngày theo local-first
-  useEffect(() => {
-    if (!profile?.id) return;
-
-    const todayStr = getTodayWaterDay();
-    const localEntries = loadStoredWaterEntries(profile.id, todayStr);
-    const localTotal = calculateWaterTotal(localEntries);
-    const pendingSync = getPendingWaterSync(profile.id, todayStr);
-
-    waterEntriesRef.current = localEntries;
-    waterIntakeRef.current = localTotal;
-    setWaterEntries(localEntries);
-    setWaterIntake(localEntries.length > 0 ? localTotal : pendingSync?.total || 0);
-    setHasPendingCloudSync(Boolean(pendingSync));
-
-    void (async () => {
-      const cloudTotal = await fetchTodayWaterCloud(profile.id);
-      if (cloudTotal !== null && localEntries.length === 0 && !pendingSync) {
-        waterIntakeRef.current = cloudTotal;
-        setWaterIntake(cloudTotal);
-      }
-    })();
-  }, [profile?.id]);
-
-  useEffect(() => {
-    waterEntriesRef.current = waterEntries;
-  }, [waterEntries]);
-
-  useEffect(() => {
-    waterIntakeRef.current = waterIntake;
-  }, [waterIntake]);
-
-  useEffect(() => {
-    hasPendingCloudSyncRef.current = hasPendingCloudSync;
-  }, [hasPendingCloudSync]);
-
-  const handleAddWater = async (amount: number, factor: number = 1.0, name: string = 'Nước lọc') => {
-    if (!profile?.id) return toast.error("Vui lòng đăng nhập lại!");
-    const actualHydration = Math.round(amount * factor);
-    const entry = { id: Date.now().toString(), amount, actual_ml: actualHydration, name, timestamp: Date.now() };
-    const newEntries = [...waterEntriesRef.current, entry];
-    const newTotal = Math.max(0, waterIntakeRef.current + actualHydration); // Không để tổng bị âm
-    waterEntriesRef.current = newEntries;
-    waterIntakeRef.current = newTotal;
-    setWaterEntries(newEntries);
-    setWaterIntake(newTotal);
-    saveEntries(newEntries);
-    
-    if (factor < 0) {
-      toast.error(`Đã uống ${name}. Mất ${Math.abs(actualHydration)}ml lượng nước cơ thể! 📉`);
-    } else {
-      toast.success(`+${actualHydration}ml (${name})! Đã lưu vào nhật ký hôm nay.`);
-    }
-    await syncTotalToCloud(newTotal);
-  };
-
-  const handleDeleteEntry = async (id: string) => {
-    const newEntries = waterEntriesRef.current.filter(e => e.id !== id);
-    const newTotal = Math.max(0, newEntries.reduce((sum, e) => sum + (e.actual_ml || e.amount), 0));
-    waterEntriesRef.current = newEntries;
-    waterIntakeRef.current = newTotal;
-    setWaterEntries(newEntries);
-    setWaterIntake(newTotal);
-    saveEntries(newEntries);
-    toast.success("Đã xóa ghi nhận!");
-    await syncTotalToCloud(newTotal);
-  };
-
-  const handleEditEntry = async () => {
-    if (!editingEntry) return;
-    const newAmount = parseInt(editAmount);
-    if (isNaN(newAmount) || newAmount <= 0) { toast.error("Số ml không hợp lệ!"); return; }
-    const currentName = editingEntry.name || 'Nước lọc';
-    const updatedName = currentName.includes('(đã sửa)') ? currentName : `${currentName} (đã sửa)`;
-    const newEntries = waterEntriesRef.current.map(e => e.id === editingEntry.id ? { ...e, amount: newAmount, actual_ml: newAmount, name: updatedName } : e);
-    const newTotal = Math.max(0, newEntries.reduce((sum, e) => sum + (e.actual_ml || e.amount), 0));
-    waterEntriesRef.current = newEntries;
-    waterIntakeRef.current = newTotal;
-    setWaterEntries(newEntries);
-    setWaterIntake(newTotal);
-    saveEntries(newEntries);
-    setEditingEntry(null);
-    setEditAmount('');
-    toast.success("Đã cập nhật ghi nhận!");
-    await syncTotalToCloud(newTotal);
   };
 
   const handleSocialImagePicked = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1820,17 +1692,27 @@ ${historyText}`;
             try {
               // Thử dùng tính năng liên kết tài khoản của Supabase
               if (typeof supabase!.auth.linkIdentity === 'function') {
-                const { error } = await supabase!.auth.linkIdentity({
+                const { data, error } = await supabase!.auth.linkIdentity({
                   provider: 'google',
-                  options: { scopes: 'https://www.googleapis.com/auth/calendar.readonly', redirectTo: window.location.origin }
+                  options: { 
+                    scopes: 'https://www.googleapis.com/auth/calendar.readonly', 
+                    redirectTo: Capacitor.isNativePlatform() ? 'digiwell://login-callback' : window.location.origin,
+                    skipBrowserRedirect: Capacitor.isNativePlatform() 
+                  }
                 });
                 if (error) throw error;
+                if (data?.url && Capacitor.isNativePlatform()) await Browser.open({ url: data.url });
               } else {
-                const { error } = await supabase!.auth.signInWithOAuth({
+                const { data, error } = await supabase!.auth.signInWithOAuth({
                   provider: 'google',
-                  options: { scopes: 'https://www.googleapis.com/auth/calendar.readonly', redirectTo: window.location.origin }
+                  options: { 
+                    scopes: 'https://www.googleapis.com/auth/calendar.readonly', 
+                    redirectTo: Capacitor.isNativePlatform() ? 'digiwell://login-callback' : window.location.origin,
+                    skipBrowserRedirect: Capacitor.isNativePlatform()
+                  }
                 });
                 if (error) throw error;
+                if (data?.url && Capacitor.isNativePlatform()) await Browser.open({ url: data.url });
               }
             } catch (err: any) {
               toast.dismiss(tid);
@@ -1922,7 +1804,7 @@ ${historyText}`;
             try {
               const result = await ai.models.generateContent({
                 model: modelName,
-                contents: [ prompt, { inlineData: { data: base64Data, mimeType: file.type } } ]
+                contents: [ prompt, { inlineData: { data: base64Data, mimeType: file.type || 'image/jpeg' } } ]
               });
               responseText = result.text || "";
               break;
@@ -2024,163 +1906,35 @@ ${historyText}`;
 
         {/* ==================== HOME TAB ==================== */}
         {activeTab === 'home' && (
-          <div className="space-y-5 animate-in fade-in zoom-in duration-300">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-slate-500 text-xs font-semibold uppercase tracking-widest">{nowText.date}</p>
-                <h1 className="text-2xl font-black text-white mt-0.5">
-                  Chào, <span className="text-cyan-400">{profile?.nickname || 'bạn'}</span> 👋
-                </h1>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="text-right">
-                  <p className="text-white font-mono text-sm font-bold">{nowText.time}</p>
-                  <p className={`text-[10px] font-black uppercase tracking-widest ${hasPendingCloudSync ? 'text-amber-400' : 'text-emerald-400'}`}>
-                    {hasPendingCloudSync ? 'Chờ đồng bộ' : 'Đã đồng bộ'}
-                  </p>
-                </div>
-                <button onClick={() => setShowSmartHub(true)} className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center relative shadow-[0_0_10px_rgba(6,182,212,0.2)] hover:bg-slate-700 transition-all">
-                  <Sparkles size={16} className="text-cyan-400" />
-                </button>
-                <button onClick={handleLogout} className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center">
-                  <User size={16} className="text-slate-400" />
-                </button>
-              </div>
-            </div>
-
-            <div className="relative overflow-hidden rounded-[2rem] border border-cyan-500/20 p-5 shadow-[0_22px_60px_rgba(8,47,73,0.35)]" style={{ background: 'linear-gradient(145deg, rgba(8,47,73,0.96), rgba(21,94,117,0.92))' }}>
-              <div className="absolute -top-10 -right-6 h-28 w-28 rounded-full bg-cyan-300/10 blur-3xl pointer-events-none" />
-              <div className="absolute -bottom-12 -left-10 h-32 w-32 rounded-full bg-sky-200/10 blur-3xl pointer-events-none" />
-              <div className="relative z-10">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex flex-wrap gap-2">
-                    <div className="px-3 py-1.5 rounded-xl bg-slate-950/35 border border-white/10 text-[10px] font-black uppercase tracking-widest text-cyan-100">
-                      Hôm nay
-                    </div>
-                    <div className={`px-3 py-1.5 rounded-xl border text-[10px] font-black uppercase tracking-widest ${hasPendingCloudSync ? 'bg-amber-500/10 text-amber-200 border-amber-400/20' : 'bg-emerald-500/10 text-emerald-100 border-emerald-400/20'}`}>
-                      {hasPendingCloudSync ? 'Chờ đồng bộ' : 'Đã đồng bộ'}
-                    </div>
-                  </div>
-                  <button onClick={handleScan} disabled={isScanning} className="px-3 py-2 rounded-xl bg-white/90 text-slate-900 text-[11px] font-black flex items-center gap-2 active:scale-95 transition-all disabled:opacity-60">
-                    <Scan size={14} /> {isScanning ? 'Đang quét' : 'AI Scan'}
-                  </button>
-                </div>
-
-                <div className="mt-5 flex items-center justify-between gap-4">
-                  <div className="min-w-0">
-                    <p className="text-cyan-100/70 text-xs uppercase tracking-widest font-bold">Lượng nước</p>
-                    <div className="flex items-baseline gap-2 mt-2">
-                      <span className="text-6xl font-black text-white tracking-tighter">{waterIntake}</span>
-                      <span className="text-cyan-100/80 text-lg font-semibold">/ {waterGoal} ml</span>
-                    </div>
-                    <p className="text-cyan-100/70 text-sm mt-2">Còn thiếu {remainingWater} ml để hoàn thành mục tiêu.</p>
-                  </div>
-
-                  <div
-                    className="relative h-24 w-24 rounded-full flex-shrink-0"
-                    style={{ background: `conic-gradient(#67e8f9 ${Math.max(progress, 2) * 3.6}deg, rgba(15,23,42,0.35) 0deg)` }}
-                  >
-                    <div className="absolute inset-[7px] rounded-full bg-slate-950/80 border border-white/10 flex flex-col items-center justify-center">
-                      <span className="text-white text-xl font-black">{completionPercent}%</span>
-                      <span className="text-cyan-100/60 text-[9px] font-bold uppercase tracking-widest">mục tiêu</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2 mt-5">
-                  {[
-                    { label: 'Streak', value: `${streak} ngày`, tone: 'text-orange-200' },
-                    { label: 'Còn thiếu', value: `${remainingWater} ml`, tone: 'text-cyan-100' },
-                    { label: 'Mục tiêu', value: `${waterGoal} ml`, tone: 'text-emerald-100' },
-                  ].map(item => (
-                    <div key={item.label} className="rounded-2xl border border-white/10 bg-slate-950/25 px-3 py-3">
-                      <p className="text-[10px] uppercase tracking-widest font-bold text-cyan-100/50">{item.label}</p>
-                      <p className={`mt-1 text-sm font-black ${item.tone}`}>{item.value}</p>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="mt-4 rounded-2xl border border-white/10 bg-slate-950/25 p-4 flex items-center gap-4">
-                  <div className={`w-16 h-16 rounded-2xl flex items-center justify-center border flex-shrink-0 ${progress < 30 ? 'bg-red-500/10 border-red-500/20' : progress < 70 ? 'bg-cyan-500/10 border-cyan-500/20' : 'bg-emerald-500/10 border-emerald-500/20'}`}>
-                    <span className="text-2xl font-mono text-white font-black">{assistantFace}</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className={`text-sm font-black ${assistantTone}`}>{assistantStatus}</p>
-                    <p className="text-cyan-100/60 text-xs mt-1">Holo-Pet</p>
-                  </div>
-                  <button onClick={() => setShowHistory(true)} className="px-3 py-2 rounded-xl bg-slate-900/70 border border-white/10 text-white text-[11px] font-bold flex items-center gap-2 active:scale-95 transition-all">
-                    <BarChart2 size={14} /> Lịch sử
-                  </button>
-                </div>
-
-                <div className="flex gap-2 mt-4">
-                  <button onClick={() => setShowSmartHub(true)} className="flex-1 py-3 rounded-xl bg-slate-950/35 border border-white/10 text-white text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                    <Sparkles size={14} /> Tiện ích
-                  </button>
-                  <button onClick={() => openSocialComposer('progress')} className="flex-1 py-3 rounded-xl bg-white/90 text-slate-900 text-xs font-black flex items-center justify-center gap-2 active:scale-95 transition-all">
-                    <Share2 size={14} /> Chia sẻ
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className={`${card} p-5`}>
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-white text-lg font-black">Đồ uống nhanh</h3>
-                <button onClick={() => { setEditingPresets(drinkPresets); setShowPresetManager(true); }} className="px-3 py-2 rounded-xl bg-cyan-500/10 border border-cyan-500/20 text-cyan-300 text-[11px] font-bold flex items-center gap-2 active:scale-95 transition-all">
-                  <Settings size={12} /> Cài đặt
-                </button>
-              </div>
-
-              {primaryDrinkPreset && (() => {
-                const s = presetStyles[primaryDrinkPreset.color] || presetStyles.cyan;
-                return (
-                  <button onClick={() => handleAddWater(primaryDrinkPreset.amount, primaryDrinkPreset.factor, primaryDrinkPreset.name)} className={`w-full p-5 rounded-[1.75rem] ${s.bg} border ${s.border} active:scale-[0.99] transition-all text-left ${s.hover}`}>
-                    <div className="flex items-center justify-between gap-4">
-                      <div>
-                        <p className="text-slate-200/70 text-[10px] uppercase tracking-widest font-bold">Nút chính</p>
-                        <p className="text-white text-xl font-black mt-2">{primaryDrinkPreset.name}</p>
-                        <p className={`${s.text} text-sm mt-2 font-bold`}>{primaryDrinkPreset.amount}ml · {primaryDrinkPreset.factor < 0 ? '' : '+'}{Math.round(primaryDrinkPreset.amount * primaryDrinkPreset.factor)}ml hydration</p>
-                      </div>
-                      <div className="w-14 h-14 rounded-2xl bg-slate-950/25 border border-white/10 flex items-center justify-center flex-shrink-0">
-                        {renderIcon(primaryDrinkPreset.icon, { size: 24, className: s.text })}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })()}
-
-              <div className="grid grid-cols-2 gap-3 mt-3">
-                {secondaryDrinkPresets.map(preset => {
-                  const s = presetStyles[preset.color] || presetStyles.cyan;
-                  return (
-                    <button key={preset.id} onClick={() => handleAddWater(preset.amount, preset.factor, preset.name)} className={`p-4 rounded-2xl ${s.bg} border ${s.border} active:scale-95 transition-all text-left ${s.hover}`}>
-                      <div className="flex items-start justify-between gap-3">
-                        <div>
-                          <p className="text-white text-sm font-black">{preset.name}</p>
-                          <p className={`${s.text} text-xs mt-1`}>{preset.factor < 0 ? '' : '+'}{Math.round(preset.amount * preset.factor)}ml</p>
-                        </div>
-                        <div className="w-10 h-10 rounded-xl bg-slate-950/25 border border-white/10 flex items-center justify-center flex-shrink-0">
-                          {renderIcon(preset.icon, { size: 18, className: s.text })}
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-                <button onClick={() => setShowCustomDrink(true)} className="p-4 rounded-2xl bg-slate-900/70 border border-slate-700 active:scale-95 transition-all text-left hover:bg-slate-800">
-                  <div className="flex items-start justify-between gap-3">
-                    <div>
-                      <p className="text-white text-sm font-black">Tùy chỉnh</p>
-                      <p className="text-slate-400 text-xs mt-1">Thêm đồ uống mới</p>
-                    </div>
-                    <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center flex-shrink-0">
-                      <Plus size={18} className="text-slate-300" />
-                    </div>
-                  </div>
-                </button>
-              </div>
-            </div>
-          </div>
+          <HomeTab
+            profile={profile}
+            nowText={nowText}
+            hasPendingCloudSync={hasPendingCloudSync}
+            waterIntake={waterIntake}
+            waterGoal={waterGoal}
+            remainingWater={remainingWater}
+            progress={progress}
+            completionPercent={completionPercent}
+            streak={streak}
+            assistantFace={assistantFace}
+            assistantStatus={assistantStatus}
+            assistantTone={assistantTone}
+            primaryDrinkPreset={primaryDrinkPreset}
+            secondaryDrinkPresets={secondaryDrinkPresets}
+            drinkPresets={drinkPresets}
+            isScanning={isScanning}
+            handleAddWater={handleAddWater}
+            handleScan={handleScan}
+            handleLogout={handleLogout}
+            setShowSmartHub={setShowSmartHub}
+            setShowHistory={setShowHistory}
+            openSocialComposer={openSocialComposer}
+            setShowPresetManager={setShowPresetManager}
+            setShowCustomDrink={setShowCustomDrink}
+            customDrinkForm={customDrinkForm}
+            setCustomDrinkForm={setCustomDrinkForm}
+            setEditingPresets={setEditingPresets}
+          />
         )}
 
         {/* ==================== INSIGHT TAB ==================== */}
@@ -2191,7 +1945,10 @@ ${historyText}`;
             isExportingPDF={isExportingPDF}
             handleExportPDF={handleExportPDF}
             waterIntake={waterIntake}
+            waterGoal={waterGoal}
+            weeklyChartData={weeklyHistory}
             progress={progress}
+            streak={streak}
             isAiLoading={isAiLoading}
             aiAdvice={aiAdvice}
             fetchAIAdvice={fetchAIAdvice}
@@ -2212,371 +1969,46 @@ ${historyText}`;
 
         {/* ==================== FEED TAB ==================== */}
         {activeTab === 'feed' && (
-          <div className="animate-in slide-in-from-right duration-300 space-y-5">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest">Cộng đồng</p>
-                <h2 className="text-2xl font-black text-white mt-1">Feed</h2>
-              </div>
-              <button
-                onClick={() => setShowSocialProfile(true)}
-                className="w-11 h-11 rounded-2xl border border-cyan-500/25 bg-slate-900/80 flex items-center justify-center shadow-[0_0_16px_rgba(34,211,238,0.12)] active:scale-95 transition-all"
-                title="Hồ sơ mạng xã hội"
-              >
-                <span className="text-sm font-black text-cyan-300">{(profile?.nickname || 'U')[0].toUpperCase()}</span>
-              </button>
-            </div>
-
-            <div className={`${card} p-4 border border-cyan-500/15`}>
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-2xl flex items-center justify-center font-black text-white shadow-inner flex-shrink-0" style={{ background: 'linear-gradient(135deg, #06b6d4, #0ea5e9)' }}>
-                  {(profile?.nickname || 'U')[0].toUpperCase()}
-                </div>
-                <button onClick={() => openSocialComposer('status')} className="flex-1 h-11 rounded-2xl bg-slate-900/80 border border-slate-700 text-slate-300 text-sm font-semibold text-left px-4 active:scale-[0.99] transition-all">
-                  Hôm nay bạn muốn chia sẻ gì?
-                </button>
-              </div>
-
-              <div className="grid grid-cols-3 gap-2 mt-3">
-                <button onClick={() => openSocialComposer('progress')} className="py-3 rounded-xl bg-indigo-500/12 border border-indigo-500/25 text-indigo-300 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                  <Share2 size={14} /> Tiến độ
-                </button>
-                <button onClick={() => openSocialComposer('story')} className="py-3 rounded-xl bg-fuchsia-500/10 border border-fuchsia-500/25 text-fuchsia-300 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                  <Plus size={14} /> Story
-                </button>
-                <button onClick={() => setShowDiscoverPeople(true)} className="py-3 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                  <Users size={14} /> Khám phá
-                </button>
-              </div>
-            </div>
-
-            <div className={`${card} p-4`}>
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <p className="text-white text-sm font-semibold">Stories</p>
-                </div>
-                <button onClick={() => openSocialComposer('story')} className="px-3 py-2 rounded-xl bg-fuchsia-500/10 border border-fuchsia-500/30 text-fuchsia-300 text-[11px] font-bold active:scale-95 transition-all">
-                  + Story
-                </button>
-              </div>
-
-              {socialStories.length > 0 ? (
-                <div className="flex gap-3 overflow-x-auto scrollbar-hide pb-1 snap-x snap-mandatory">
-                  {socialStories.map(story => (
-                    <div key={story.id} className="min-w-[132px] rounded-2xl border border-fuchsia-500/20 bg-slate-900/60 p-3 snap-start">
-                      <div className="w-12 h-12 rounded-2xl flex items-center justify-center mb-3 shadow-inner" style={{ background: 'linear-gradient(135deg, rgba(217,70,239,0.45), rgba(34,211,238,0.35))' }}>
-                        <span className="text-lg font-black text-white">{story.author.nickname[0]?.toUpperCase() || 'D'}</span>
-                      </div>
-                      <p className="text-white text-sm font-bold truncate">{story.author.nickname}</p>
-                      <p className="text-slate-400 text-[10px] uppercase tracking-wider mt-1">{getRelativeTimeLabel(story.created_at)}</p>
-                      <p className="text-fuchsia-300 text-[10px] mt-2 font-semibold">{story.hydration_ml || 0}ml · streak {story.streak_snapshot || 0}</p>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="rounded-2xl border border-dashed border-slate-700 bg-slate-900/40 p-4 text-center">
-                  <p className="text-white text-sm font-semibold mb-4">Chưa có story nào.</p>
-                  <button onClick={() => openSocialComposer('story')} className="px-4 py-2 rounded-xl bg-fuchsia-500/15 border border-fuchsia-500/30 text-fuchsia-300 text-xs font-bold active:scale-95 transition-all">
-                    Đăng story đầu tiên
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {socialError && (
-              <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
-                <p className="text-amber-300 text-xs font-bold uppercase tracking-widest mb-2">Thiết lập</p>
-                <p className="text-slate-200 text-sm leading-relaxed">{socialError}</p>
-              </div>
-            )}
-
-            {!socialError && isSocialLoading && (
-              <div className={`${card} p-8 text-center`}>
-                <RefreshCw size={28} className="text-cyan-400 mx-auto mb-4 animate-spin" />
-                <p className="text-white font-semibold">Đang tải feed cộng đồng...</p>
-              </div>
-            )}
-
-            {!socialError && !isSocialLoading && socialPosts.length === 0 && (
-              <div className={`${card} p-6 text-center`}>
-                <Rss size={34} className="text-cyan-400 mx-auto mb-4" />
-                <p className="text-white text-lg font-black mb-2">Feed của bạn còn rất mới</p>
-                <div className="flex gap-3">
-                  <button onClick={() => setShowDiscoverPeople(true)} className="flex-1 py-3 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-sm font-bold active:scale-95 transition-all">
-                    Tìm người để follow
-                  </button>
-                  <button onClick={() => openSocialComposer('progress')} className="flex-1 py-3 rounded-xl bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-sm font-bold active:scale-95 transition-all">
-                    Đăng progress
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {!socialError && !isSocialLoading && socialPosts.length > 0 && socialPosts.map(post => (
-              <div key={post.id} className={`${card} p-5`}>
-                <div className="flex items-start gap-3">
-                  <div className="w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0 shadow-inner" style={{ background: post.post_kind === 'progress' ? 'linear-gradient(135deg, rgba(34,211,238,0.35), rgba(59,130,246,0.35))' : 'linear-gradient(135deg, rgba(16,185,129,0.35), rgba(6,182,212,0.25))' }}>
-                    <span className="text-lg font-black text-white">{post.author.nickname[0]?.toUpperCase() || 'D'}</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-white font-black truncate">{post.author.nickname}</p>
-                        <div className="flex items-center gap-2 mt-1 flex-wrap">
-                          <span className={`px-2 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider border ${post.post_kind === 'progress' ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20' : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'}`}>
-                            {post.post_kind === 'progress' ? 'Tiến độ' : 'Bài viết'}
-                          </span>
-                          <span className="text-slate-500 text-[10px] uppercase tracking-wider">{post.visibility === 'followers' ? 'Chỉ follower' : 'Công khai'}</span>
-                        </div>
-                      </div>
-                      <p className="text-slate-500 text-[10px] uppercase tracking-wider flex-shrink-0">{getRelativeTimeLabel(post.created_at)}</p>
-                    </div>
-
-                    {post.content && (
-                      <p className="text-slate-300 text-sm leading-relaxed mt-4 whitespace-pre-wrap">{post.content}</p>
-                    )}
-
-                    {post.image_url && (
-                      <div className="mt-4 overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-900">
-                        <img src={post.image_url} alt={`Bài đăng của ${post.author.nickname}`} className="w-full h-56 object-cover" />
-                      </div>
-                    )}
-
-                    <div className="mt-4 flex items-center gap-2 flex-wrap">
-                      <div className="px-3 py-2 rounded-xl bg-slate-900/70 border border-slate-700 text-[11px] text-cyan-300 font-semibold">
-                        {post.hydration_ml || 0}ml hôm nay
-                      </div>
-                      <div className="px-3 py-2 rounded-xl bg-slate-900/70 border border-slate-700 text-[11px] text-orange-300 font-semibold">
-                        Streak {post.streak_snapshot || 0} ngày
-                      </div>
-                      {post.author.id !== profile?.id && socialFollowingIds.includes(post.author.id) && (
-                        <div className="px-3 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-[11px] text-emerald-300 font-semibold">
-                          Đang theo dõi
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-2 gap-2">
-                      <button onClick={() => handleToggleLikePost(post)} className={`py-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all ${post.likedByMe ? 'bg-rose-500/15 text-rose-300 border-rose-500/30' : 'bg-slate-900/70 text-slate-300 border-slate-700'}`}>
-                        <Heart size={14} className={post.likedByMe ? 'fill-rose-400' : ''} />
-                        {post.like_count || 0} thích
-                      </button>
-                      <button onClick={() => openSocialComposer('progress')} className="py-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                        <Share2 size={14} /> Đăng kiểu này
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-
-            <div className="space-y-3">
-              {[
-                { icon: Zap, color: '#fbbf24', bg: 'rgba(251,191,36,0.15)', border: 'rgba(251,191,36,0.3)', title: 'Giao thức buổi sáng', body: 'Sau khi ngủ dậy, hãy ưu tiên 250-300ml nước trước cà phê để kéo hydration level về trạng thái ổn định.' },
-                { icon: Target, color: '#22d3ee', bg: 'rgba(6,182,212,0.15)', border: 'rgba(6,182,212,0.3)', title: 'Thử thách 7 ngày', body: 'Theo dõi vài người bạn thân và cùng nhau hoàn thành 100% mục tiêu nước trong 7 ngày liên tiếp.' },
-              ].map(({ icon: Icon, color, bg, border, title, body }) => (
-                <div key={title} className={`${card} p-4`} style={{ borderColor: border }}>
-                  <div className="flex items-start gap-4">
-                    <div className="w-11 h-11 rounded-2xl flex items-center justify-center flex-shrink-0" style={{ background: bg, border: `1px solid ${border}` }}>
-                      <Icon size={18} style={{ color }} />
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-white font-bold text-sm mb-1">{title}</p>
-                      <p className="text-slate-400 text-xs leading-relaxed">{body}</p>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
+          <FeedTab
+            profile={profile}
+            socialStories={socialStories}
+            socialPosts={socialPosts}
+            socialError={socialError}
+            isSocialLoading={isSocialLoading}
+            socialFollowingIds={socialFollowingIds}
+            openSocialComposer={openSocialComposer}
+            setShowSocialProfile={setShowSocialProfile}
+            setShowDiscoverPeople={setShowDiscoverPeople}
+            handleToggleLikePost={handleToggleLikePost}
+          />
         )}
 
         {/* ==================== PROFILE TAB ==================== */}
         {activeTab === 'profile' && (
-          <div className="animate-in slide-in-from-right duration-300 space-y-5 pb-6">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h2 className="text-3xl font-black text-white">Hồ sơ</h2>
-              </div>
-              <div className="flex items-center gap-2">
-                {!isPremium ? (
-                  <button onClick={() => setShowPremiumModal(true)} className="px-4 py-2 rounded-xl text-xs font-bold text-slate-900 shadow-[0_0_15px_rgba(245,158,11,0.3)] active:scale-95 transition-all" style={{ background: 'linear-gradient(135deg, #fbbf24, #d97706)' }}>
-                    Upgrade PRO
-                  </button>
-                ) : (
-                  <div className="px-3 py-1.5 rounded-lg text-[10px] font-bold text-amber-400 bg-amber-500/10 border border-amber-500/30 flex items-center gap-1">
-                    <Sparkles size={12} /> PRO
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className={`${cardGlow} overflow-hidden`}>
-              <div className="relative p-6">
-                <div className="absolute -top-12 -right-8 w-32 h-32 rounded-full blur-3xl bg-cyan-500/15 pointer-events-none" />
-                <div className="absolute -bottom-14 -left-10 w-36 h-36 rounded-full blur-3xl bg-amber-500/10 pointer-events-none" />
-                <div className="relative flex items-start gap-4">
-                  <div className="w-20 h-20 rounded-[1.75rem] flex items-center justify-center flex-shrink-0 shadow-lg" style={{ background: isPremium ? 'linear-gradient(135deg, #fbbf24, #d97706)' : 'linear-gradient(135deg, #06b6d4, #0ea5e9)' }}>
-                    <span className="text-4xl font-black text-slate-900">{(profile?.nickname || 'U')[0].toUpperCase()}</span>
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <h3 className="text-2xl font-black text-white truncate">{profile?.nickname || 'Khách'}</h3>
-                        <div
-                          className={`w-7 h-7 rounded-xl border flex items-center justify-center flex-shrink-0 ${currentRank.bg} ${currentRank.border}`}
-                          title={currentRank.name}
-                        >
-                          <Trophy size={12} className={currentRank.color} />
-                        </div>
-                        <div className="px-2 py-1 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-center gap-1" title={`Streak: ${streak} ngày`}>
-                          <Zap size={10} className="fill-orange-400 text-orange-400" />
-                          <span className="text-orange-400 text-[10px] font-bold">{streak}</span>
-                        </div>
-                      </div>
-                    </div>
-                    
-                    <div className="flex gap-4 mt-4">
-                      <div className="text-center">
-                        <p className="text-white font-black text-sm">{socialProfileStats.followers}</p>
-                        <p className="text-slate-500 text-[9px] uppercase font-bold tracking-widest mt-0.5">Follower</p>
-                      </div>
-                      <div className="text-center">
-                        <p className="text-white font-black text-sm">{socialProfileStats.following}</p>
-                        <p className="text-slate-500 text-[9px] uppercase font-bold tracking-widest mt-0.5">Đang follow</p>
-                      </div>
-                      <div className="text-center">
-                        <p className="text-white font-black text-sm">{calculateWP(waterIntake, waterGoal, streak)}</p>
-                        <p className="text-slate-500 text-[9px] uppercase font-bold tracking-widest mt-0.5">Điểm WP</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 mt-5 relative z-10">
-                  <button onClick={() => setShowAddFriend(true)} className="py-2.5 rounded-xl bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                    <UserPlus size={14} /> Thêm bạn
-                  </button>
-                  <button onClick={() => setShowProfileSettings(true)} className="py-2.5 rounded-xl bg-slate-800/80 border border-slate-700 text-slate-300 text-xs font-bold flex items-center justify-center gap-2 active:scale-95 transition-all">
-                    <Settings size={14} /> Cài đặt
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className={`${card} p-5`}>
-              <div className="flex items-center justify-between mb-5">
-                <h3 className="text-white text-lg font-black">Tiến độ tuần này</h3>
-                <button onClick={() => setActiveTab('insight')} className="text-cyan-400 text-[10px] font-bold uppercase tracking-widest bg-cyan-500/10 px-2 py-1 rounded-lg border border-cyan-500/20 active:scale-95 transition-all">
-                  Chi tiết
-                </button>
-              </div>
-              <div className="flex items-end justify-between gap-1.5 h-24">
-                {[
-                  { d: 'T3', pct: 70 }, { d: 'T4', pct: 80 }, { d: 'T5', pct: 40 },
-                  { d: 'T6', pct: 90 }, { d: 'T7', pct: 95 }, { d: 'CN', pct: 60 },
-                  { d: 'HN', pct: Math.max((waterIntake / waterGoal) * 100, 5), isToday: true }
-                ].map(item => (
-                  <div key={item.d} className="flex-1 flex flex-col items-center gap-1.5">
-                    <div className="w-full rounded-lg relative overflow-hidden bg-slate-900 border border-slate-700/50" style={{ height: '60px' }}>
-                      <div className="absolute bottom-0 w-full rounded-lg transition-all duration-700"
-                        style={{ height: `${item.pct}%`, background: item.isToday ? 'linear-gradient(180deg, #06b6d4, #0ea5e9)' : 'rgba(6,182,212,0.2)' }} />
-                    </div>
-                    <span className="text-[9px] font-bold" style={{ color: item.isToday ? '#22d3ee' : '#64748b' }}>{item.d}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className={`${card} p-5`}>
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <h3 className="text-white text-lg font-black">Hôm nay</h3>
-                </div>
-                <button onClick={() => setActiveTab('feed')} className="px-3 py-2 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-[11px] font-bold active:scale-95 transition-all">
-                  Xem Feed
-                </button>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                {[
-                  { label: 'Đã uống', value: `${waterIntake} ml`, tone: 'text-cyan-300' },
-                  { label: 'Hoàn thành', value: `${completionPercent}%`, tone: 'text-emerald-300' },
-                  { label: 'Còn thiếu', value: `${remainingWater} ml`, tone: 'text-orange-300' },
-                  { label: 'Hạng hiện tại', value: currentRank.name, tone: currentRank.color },
-                ].map(item => (
-                  <div key={item.label} className="rounded-2xl border border-slate-700/60 bg-slate-900/60 p-3 flex flex-col justify-center">
-                    <p className="text-slate-500 text-[9px] uppercase tracking-widest font-bold">{item.label}</p>
-                    <p className={`mt-1 text-base font-black ${item.tone}`}>{item.value}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* HUY HIỆU & THỬ THÁCH */}
-            <div className={`${card} p-5 mt-2`}>
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="text-white text-lg font-black">Huy hiệu & Thử thách</h3>
-                <button className="text-cyan-400 text-[10px] font-bold uppercase tracking-widest bg-cyan-500/10 px-2 py-1 rounded-lg border border-cyan-500/20 active:scale-95 transition-all">
-                  Tất cả
-                </button>
-              </div>
-              <div className="grid grid-cols-3 gap-3">
-                <div className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-900/50 border border-cyan-500/20 relative overflow-hidden">
-                  <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 to-transparent"></div>
-                  <div className="w-10 h-10 rounded-full bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center mb-2 relative z-10">
-                    <Medal size={20} className="text-cyan-400" />
-                  </div>
-                  <p className="text-white text-[10px] font-bold text-center relative z-10">Kỷ luật thép</p>
-                  <p className="text-cyan-400 text-[9px] mt-0.5 relative z-10">7 ngày Streak</p>
-                </div>
-                
-                <div className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-900/50 border border-orange-500/20 relative overflow-hidden">
-                  <div className="absolute inset-0 bg-gradient-to-br from-orange-500/10 to-transparent"></div>
-                  <div className="w-10 h-10 rounded-full bg-orange-500/20 border border-orange-500/30 flex items-center justify-center mb-2 relative z-10">
-                    <Flame size={20} className="text-orange-400" />
-                  </div>
-                  <p className="text-white text-[10px] font-bold text-center relative z-10">Chiến thần</p>
-                  <p className="text-orange-400 text-[9px] mt-0.5 relative z-10">Hoàn thành 100%</p>
-                </div>
-                
-                <div className="flex flex-col items-center justify-center p-3 rounded-2xl bg-slate-900/50 border border-emerald-500/20 relative overflow-hidden opacity-50 grayscale">
-                  <div className="w-10 h-10 rounded-full bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center mb-2">
-                    <Bike size={20} className="text-emerald-400" />
-                  </div>
-                  <p className="text-white text-[10px] font-bold text-center">Vận động viên</p>
-                  <p className="text-emerald-400 text-[9px] mt-0.5 flex items-center justify-center gap-0.5"><Lock size={8}/> Chưa mở</p>
-                </div>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-red-500/20 bg-red-500/5 p-4 mt-2">
-              <button onClick={handleLogout} className="w-full py-4 rounded-2xl text-red-400 font-bold text-sm border border-red-500/30 bg-red-500/10 active:scale-95 transition-all flex items-center justify-center gap-2 hover:bg-red-500/20">
-                <Lock size={18} /> Đăng xuất tài khoản
-              </button>
-            </div>
-          </div>
+          <ProfileTab
+            profile={profile}
+            isPremium={isPremium}
+            streak={streak}
+            socialProfileStats={socialProfileStats}
+            waterIntake={waterIntake}
+            waterGoal={waterGoal}
+            weeklyHistory={weeklyHistory}
+            progress={progress}
+            completionPercent={completionPercent}
+            remainingWater={remainingWater}
+            currentRank={currentRank}
+            wp={calculateWP(waterIntake, waterGoal, streak)}
+            setShowPremiumModal={setShowPremiumModal}
+            setShowAddFriend={setShowAddFriend}
+            setShowProfileSettings={setShowProfileSettings}
+            setActiveTab={setActiveTab}
+            handleLogout={handleLogout}
+          />
         )}
       </div>
 
       {/* BOTTOM NAV */}
-      <div className="absolute bottom-0 left-0 right-0 px-5 pb-6 pt-4" style={{ background: 'linear-gradient(to top, #0f172a 70%, transparent)' }}>
-        <div className="flex items-center justify-between bg-slate-800/95 backdrop-blur-xl border border-slate-700/60 rounded-3xl px-4 py-3 shadow-[0_20px_50px_rgba(0,0,0,0.5)]">
-          {([
-            ['home', Home, 'Home'],
-            ['insight', BarChart2, 'Insight'],
-            ['league', Trophy, 'League'],
-            ['feed', Rss, 'Feed'],
-            ['profile', User, 'Profile'],
-          ] as const).map(([tab, Icon, label]) => (
-            <button key={tab} onClick={() => setActiveTab(tab)}
-              className={`flex flex-col items-center gap-1.5 px-3 py-2 rounded-2xl transition-all duration-300 ${activeTab === tab ? 'scale-110 bg-slate-700/50' : 'opacity-50'}`}>
-              <Icon size={22} style={{ color: activeTab === tab ? '#22d3ee' : '#94a3b8' }} />
-              <span className="text-[9px] font-black uppercase tracking-widest" style={{ color: activeTab === tab ? '#22d3ee' : '#64748b' }}>{label}</span>
-            </button>
-          ))}
-        </div>
-      </div>
+      <BottomNav activeTab={activeTab} setActiveTab={setActiveTab} />
 
       {/* ===== HISTORY MODAL ===== */}
       {showHistory && (
@@ -2603,7 +2035,7 @@ ${historyText}`;
                   return (
                     <div key={entry.id} className="flex items-center gap-3 p-3 rounded-xl" style={{ background: 'rgba(6,182,212,0.06)', border: '1px solid rgba(6,182,212,0.12)' }}>
                       <div className="w-9 h-9 rounded-xl bg-cyan-500/20 flex items-center justify-center flex-shrink-0">
-                    <Cpu size={16} className="text-cyan-400" />
+                        <Droplet size={16} className="text-cyan-400" />
                       </div>
                       <div className="flex-1">
                         <p className={`font-bold text-sm ${(entry.actual_ml !== undefined && entry.actual_ml < 0) ? 'text-red-400' : 'text-white'}`}>
@@ -2775,8 +2207,8 @@ ${historyText}`;
                 <div className="p-4 rounded-2xl flex items-center gap-3" style={{ background: 'linear-gradient(135deg, #4f46e5, #7c3aed)' }}>
                   <Bell size={18} className="text-white flex-shrink-0" />
                   <div>
-                    <p className="text-white text-sm font-bold">{calendarEvents[1].title}</p>
-                    <p className="text-indigo-200 text-xs">14:00 · Hãy uống 300ml nước trước khi di chuyển!</p>
+                    <p className="text-white text-sm font-bold">{calendarEvents[0]?.title || 'Không có sự kiện'}</p>
+                    <p className="text-indigo-200 text-xs">{calendarEvents[0]?.time || '--:--'} · Nhớ uống nước trước khi bắt đầu nhé!</p>
                   </div>
                 </div>
               )}
@@ -2802,64 +2234,14 @@ ${historyText}`;
               )}
 
               {/* AUTO-DETECT ACTIVITY CARD */}
-              <div className={`${card} p-5 relative overflow-hidden`}>
-                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-emerald-500 to-cyan-500 opacity-50"></div>
-                <div className="flex justify-between items-center mb-3">
-                  <div>
-                    <p className="text-sm font-bold text-white">Cường độ vận động</p>
-                  </div>
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border"
-                    style={isWatchConnected || isCalendarSynced
-                      ? { background: 'rgba(16,185,129,0.1)', borderColor: 'rgba(16,185,129,0.3)' }
-                      : { background: 'rgba(100,116,139,0.1)', borderColor: 'rgba(100,116,139,0.3)' }}>
-                    <div className={`w-2 h-2 rounded-full ${isWatchConnected || isCalendarSynced ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></div>
-                    <span className={`text-[9px] font-bold uppercase tracking-widest ${isWatchConnected || isCalendarSynced ? 'text-emerald-400' : 'text-slate-500'}`}>
-                      {isWatchConnected || isCalendarSynced ? 'Tự động' : 'Thủ công'}
-                    </span>
-                  </div>
-                </div>
-
-                {!isWatchConnected && !isCalendarSynced ? (
-                  <>
-                    <div className="flex gap-2">
-                      {([
-                        ['chill', MonitorPlay, 'Nghỉ ngơi', '+0ml'],
-                        ['light', Activity, 'Đi lại nhẹ', '+400ml'],
-                        ['hard', Dumbbell, 'Tập luyện', '+800ml'],
-                      ] as const).map(([key, Icon, label, bonus]) => (
-                        <button key={key} onClick={() => setCurrentActivity(key as any)}
-                          className={`flex-1 flex flex-col items-center justify-center gap-1 py-3 rounded-xl text-xs font-bold transition-all ${currentActivity === key ? 'text-slate-900' : 'text-slate-400 bg-slate-800/50 border border-slate-700'}`}
-                          style={currentActivity === key ? { background: 'linear-gradient(135deg, #06b6d4, #0ea5e9)' } : {}}>
-                          <Icon size={15} />
-                          <span>{label}</span>
-                          <span className={`text-[9px] font-normal ${currentActivity === key ? 'text-slate-700' : 'text-slate-500'}`}>{bonus}</span>
-                        </button>
-                      ))}
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex items-center gap-3 bg-slate-900/50 rounded-xl p-3">
-                    <div className="w-9 h-9 rounded-xl flex items-center justify-center"
-                      style={{ background: isCalendarSynced && calendarEvents.some(e => ['gym','tập','chạy','yoga','bơi'].some(kw => e.title.toLowerCase().includes(kw))) ? 'rgba(239,68,68,0.2)' : watchData.heartRate >= 100 || watchData.steps >= 8000 ? 'rgba(239,68,68,0.2)' : watchData.heartRate >= 85 || watchData.steps >= 4000 ? 'rgba(234,179,8,0.2)' : 'rgba(6,182,212,0.2)' }}>
-                      <Activity size={16} className="text-white" />
-                    </div>
-                    <div>
-                      <p className="text-white text-sm font-bold">
-                        {isCalendarSynced ? 'Phát hiện từ Calendar' : `${watchData.steps} bước · ${watchData.heartRate} BPM`}
-                      </p>
-                      <p className="text-slate-400 text-xs">
-                        {(() => {
-                          const gymKws = ['gym','tập','chạy','yoga','bơi'];
-                          if (isCalendarSynced && calendarEvents.some(e => gymKws.some(kw => e.title.toLowerCase().includes(kw)))) return 'Vận động mạnh · +800ml';
-                          if (isWatchConnected && (watchData.steps >= 8000 || watchData.heartRate >= 100)) return 'Vận động mạnh · +800ml';
-                          if (isWatchConnected && (watchData.steps >= 4000 || watchData.heartRate >= 85)) return 'Vận động vừa · +400ml';
-                          return 'Ít vận động · +0ml';
-                        })()}
-                      </p>
-                    </div>
-                  </div>
-                )}
-              </div>
+              <AutoActivityCard
+                isWatchConnected={isWatchConnected}
+                isCalendarSynced={isCalendarSynced}
+                watchData={watchData}
+                calendarEvents={calendarEvents}
+                currentActivity={currentActivity}
+                setCurrentActivity={setCurrentActivity}
+              />
 
               {/* Eye rest */}
               <button onClick={() => toast.success("Đã bật chế độ bảo vệ mắt. Hệ thống sẽ nhắc bạn nhìn xa 6 mét trong 20 giây mỗi 20 phút.")} className={`${card} w-full p-5 flex items-center gap-4 active:scale-95 transition-all text-left border-l-4 border-l-violet-500`}>
@@ -2958,14 +2340,17 @@ ${historyText}`;
               <div>
                 <h3 className="text-xl font-black text-white">Menu đồ uống</h3>
               </div>
-              <button onClick={() => setShowPresetManager(false)} className="text-slate-400 hover:text-white">✕</button>
+              <div className="flex items-center gap-3">
+                <button onClick={() => setEditingPresets([...editingPresets, { id: Date.now().toString(), name: 'Đồ uống mới', amount: 200, factor: 1.0, icon: 'Droplet', color: 'cyan' }])} className="text-cyan-400 bg-cyan-500/10 p-1.5 rounded-lg border border-cyan-500/20 active:scale-95 transition-all"><Plus size={18} /></button>
+                <button onClick={() => setShowPresetManager(false)} className="text-slate-400 hover:text-white"><X size={22} /></button>
+              </div>
             </div>
 
             <div className="space-y-3 mb-6 max-h-[55vh] overflow-y-auto pr-1">
               {editingPresets.map((p, idx) => (
                 <div key={p.id} className="p-3.5 rounded-xl bg-slate-900 border border-slate-700 space-y-3">
                   <div className="flex items-center gap-3">
-                    {renderIcon(p.icon, { size: 18, className: presetStyles[p.color].text })}
+                    {renderIcon(p.icon, { size: 18, className: presetStyles[p.color as keyof typeof presetStyles]?.text || 'text-cyan-400' })}
                     <input type="text" value={p.name} onChange={e => handleUpdatePreset(idx, 'name', e.target.value)} className="flex-1 bg-transparent border-b border-slate-700 text-white text-sm font-bold outline-none focus:border-cyan-500 pb-1" />
                   </div>
                   <div className="flex gap-3">
@@ -3054,7 +2439,7 @@ ${historyText}`;
                 <div className="absolute -bottom-12 -left-10 w-32 h-32 rounded-full blur-3xl bg-indigo-500/10 pointer-events-none" />
                 <div className="relative flex items-start gap-4">
                   <div className="w-20 h-20 rounded-[1.75rem] flex items-center justify-center flex-shrink-0 shadow-lg" style={{ background: 'linear-gradient(135deg, #06b6d4, #0ea5e9)' }}>
-                    <span className="text-4xl font-black text-slate-900">{(profile?.nickname || 'U')[0].toUpperCase()}</span>
+                    <span className="text-4xl font-black text-slate-900">{(profile?.nickname || 'U').charAt(0).toUpperCase()}</span>
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 min-w-0">
@@ -3196,7 +2581,7 @@ ${historyText}`;
                     <div className="flex items-center justify-between gap-3">
                       <div className="flex items-center gap-3 min-w-0">
                         <div className="w-12 h-12 rounded-2xl flex items-center justify-center font-black text-white shadow-inner" style={{ background: 'linear-gradient(135deg, #10b981, #06b6d4)' }}>
-                          {user.nickname[0]?.toUpperCase() || 'D'}
+                          {(user.nickname || 'D').charAt(0).toUpperCase()}
                         </div>
                         <div className="min-w-0">
                           <p className="text-white text-sm font-bold truncate">{user.nickname}</p>
@@ -3351,7 +2736,7 @@ ${historyText}`;
               <div>
                 <h3 className="text-xl font-black text-white">Thêm bạn bè</h3>
               </div>
-              <button onClick={() => { setShowAddFriend(false); setSearchQuery(''); setSearchResults([]); }} className="text-slate-400 hover:text-white">✕</button>
+              <button onClick={() => { setShowAddFriend(false); setSearchQuery(''); setSearchResults([]); }} className="text-slate-400 hover:text-white"><X size={22} /></button>
             </div>
             
             <div className="relative mb-6">
@@ -3367,10 +2752,10 @@ ${historyText}`;
                   <div key={user.id} className="flex items-center justify-between p-3 rounded-xl bg-slate-800 border border-slate-700">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 rounded-full flex items-center justify-center font-bold text-white shadow-inner" style={{ background: 'linear-gradient(135deg, #10b981, #059669)' }}>
-                        {user.nickname.charAt(0).toUpperCase()}
+                        {(user.nickname || 'U').charAt(0).toUpperCase()}
                       </div>
                       <div>
-                        <p className="text-white text-sm font-bold">{user.nickname}</p>
+                        <p className="text-white text-sm font-bold">{user.nickname || 'Người dùng'}</p>
                         <p className="text-slate-400 text-[10px]">Người dùng DigiWell</p>
                       </div>
                     </div>
@@ -3499,7 +2884,7 @@ ${historyText}`;
               <div>
                 <h3 className="text-xl font-black text-white">Chỉnh sửa thông tin</h3>
               </div>
-              <button onClick={() => setShowEditProfile(false)} className="text-slate-400 hover:text-white">✕</button>
+              <button onClick={() => setShowEditProfile(false)} className="text-slate-400 hover:text-white"><X size={22} /></button>
             </div>
 
             <form onSubmit={handleSaveProfile} className="space-y-4">
@@ -3568,78 +2953,15 @@ ${historyText}`;
         </div>
       )}
 
-      {/* ===== AI CHAT MODAL (PREMIUM) ===== */}
-      {showAiChat && (
-        <div className="fixed inset-0 z-[100] flex flex-col bg-slate-950">
-          <div className="flex items-center justify-between px-5 pt-8 pb-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-10">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center shadow-inner">
-                <Bot size={20} className="text-indigo-400" />
-              </div>
-              <div>
-                <h3 className="text-white font-black text-lg">DigiWell AI</h3>
-                <p className="text-indigo-400 text-[10px] uppercase tracking-widest font-bold flex items-center gap-1">
-                  <Sparkles size={10} /> Trợ lý Premium
-                </p>
-              </div>
-            </div>
-            <button onClick={() => setShowAiChat(false)} className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-slate-400 hover:text-white active:scale-95 transition-all">
-              <X size={18} />
-            </button>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-5 space-y-5 scrollbar-hide">
-            {chatMessages.length === 0 && !isChatLoading && (
-              <div className="flex flex-col items-center justify-center h-full opacity-50 space-y-4">
-                <Bot size={48} className="text-indigo-400" />
-                <p className="text-slate-400 text-sm text-center">
-                  Hãy thử: "Ghi nhận giúp tôi 1 ly trà đào 300ml"<br/>hoặc hỏi về chế độ dinh dưỡng.
-                </p>
-              </div>
-            )}
-            {chatMessages.map((msg, i) => (
-              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                {msg.role !== 'user' && (
-                  <div className="w-8 h-8 rounded-full bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center mr-2 flex-shrink-0 self-end mb-1">
-                    <Bot size={14} className="text-indigo-400" />
-                  </div>
-                )}
-                <div className={`max-w-[75%] p-3.5 rounded-2xl shadow-sm ${msg.role === 'user' ? 'bg-cyan-500 text-slate-900 rounded-br-sm font-medium' : 'bg-slate-800 border border-slate-700 text-slate-200 rounded-bl-sm'}`}>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap">{msg.content}</p>
-                </div>
-              </div>
-            ))}
-            {isChatLoading && (
-              <div className="flex justify-start items-end">
-                <div className="w-8 h-8 rounded-full bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center mr-2 flex-shrink-0 mb-1">
-                  <Bot size={14} className="text-indigo-400" />
-                </div>
-                <div className="max-w-[75%] p-4 rounded-2xl bg-slate-800 border border-slate-700 text-slate-400 rounded-bl-sm flex gap-1.5 items-center h-[46px]">
-                  <div className="w-2 h-2 rounded-full bg-indigo-400/70 animate-bounce" />
-                  <div className="w-2 h-2 rounded-full bg-indigo-400/70 animate-bounce" style={{ animationDelay: '0.15s' }} />
-                  <div className="w-2 h-2 rounded-full bg-indigo-400/70 animate-bounce" style={{ animationDelay: '0.3s' }} />
-                </div>
-              </div>
-            )}
-            <div ref={chatEndRef} className="h-2" />
-          </div>
-
-          <div className="p-4 bg-slate-900/95 border-t border-slate-800 backdrop-blur-xl pb-8">
-            <form onSubmit={handleSendChatMessage} className="flex gap-2">
-              <input 
-                type="text" 
-                value={chatInput} 
-                onChange={(e) => setChatInput(e.target.value)} 
-                placeholder="Hỏi AI hoặc nhờ thêm nước..." 
-                className="flex-1 bg-slate-800/80 border border-slate-700 rounded-full px-5 py-3.5 text-sm text-white outline-none focus:border-cyan-500 shadow-inner" 
-              />
-              <button type="submit" disabled={isChatLoading || !chatInput.trim()} className="w-[50px] h-[50px] rounded-full bg-cyan-500 flex items-center justify-center text-slate-900 disabled:opacity-50 active:scale-95 transition-all shadow-[0_0_15px_rgba(6,182,212,0.3)] flex-shrink-0">
-                <Send size={20} className="ml-1" />
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      <AiChatModal
+        isOpen={showAiChat}
+        onClose={() => setShowAiChat(false)}
+        messages={chatMessages}
+        isLoading={isChatLoading}
+        input={chatInput}
+        onInputChange={setChatInput}
+        onSubmit={handleSendChatMessage}
+      />
     </div>
   );
 }

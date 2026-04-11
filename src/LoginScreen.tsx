@@ -1,6 +1,8 @@
 import { useState, type FormEvent } from 'react';
 import { ChevronLeft, Lock } from 'lucide-react';
 import { Toaster, toast } from 'sonner';
+import { Capacitor } from '@capacitor/core';
+import { Browser } from '@capacitor/browser';
 import { supabase } from './lib/supabase';
 
 interface LoginScreenProps {
@@ -30,15 +32,17 @@ export default function LoginScreen({ onBack, initialEmail = '' }: LoginScreenPr
 
   const handleGoogleLogin = async () => {
     try {
-      const { error } = await supabase!.auth.signInWithOAuth({
+      const { data, error } = await supabase!.auth.signInWithOAuth({
         provider: 'google',
         options: {
           // Xin quyền Đọc Lịch Google
           scopes: 'https://www.googleapis.com/auth/calendar.readonly',
-          redirectTo: window.location.origin
+          redirectTo: Capacitor.isNativePlatform() ? 'digiwell://login-callback' : window.location.origin,
+          skipBrowserRedirect: Capacitor.isNativePlatform()
         }
       });
       if (error) throw error;
+      if (data?.url && Capacitor.isNativePlatform()) await Browser.open({ url: data.url });
     } catch (err: any) {
       toast.error("Lỗi kết nối Google: " + err.message);
     }
@@ -46,13 +50,15 @@ export default function LoginScreen({ onBack, initialEmail = '' }: LoginScreenPr
 
   const handleAppleLogin = async () => {
     try {
-      const { error } = await supabase!.auth.signInWithOAuth({
+      const { data, error } = await supabase!.auth.signInWithOAuth({
         provider: 'apple',
         options: {
-          redirectTo: window.location.origin
+          redirectTo: Capacitor.isNativePlatform() ? 'digiwell://login-callback' : window.location.origin,
+          skipBrowserRedirect: Capacitor.isNativePlatform()
         }
       });
       if (error) throw error;
+      if (data?.url && Capacitor.isNativePlatform()) await Browser.open({ url: data.url });
     } catch (err: any) {
       toast.error("Lỗi kết nối Apple: " + err.message);
     }
